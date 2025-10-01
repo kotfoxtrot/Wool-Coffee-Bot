@@ -1,5 +1,7 @@
 import logging
 import sys
+import os
+from pathlib import Path
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -8,21 +10,29 @@ from dotenv import load_dotenv
 
 from .config import Config
 from .sheets_manager import SheetsManager
-from .handlers import start_command, help_command, tasks_command, history_command, button_callback
+from .handlers import start_command, help_command, tasks_command, history_command, button_callback, setup_table_command
 from .scheduler import check_and_send_notifications
+
+Path('./logs').mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
     handlers=[
-        logging.StreamHandler(sys.stdout)
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('logs/info.log', mode='w', encoding='utf-8')
     ]
 )
 
 logger = logging.getLogger(__name__)
 
 
-def setup_scheduler(application: Application, config: Config, sheets_manager: SheetsManager):
+async def post_init(application: Application):
+    logger.info("Bot initialized successfully")
+    
+    config: Config = application.bot_data['config']
+    sheets_manager: SheetsManager = application.bot_data['sheets_manager']
+    
     scheduler = AsyncIOScheduler(timezone=config.timezone)
     
     scheduler.add_job(
@@ -37,14 +47,13 @@ def setup_scheduler(application: Application, config: Config, sheets_manager: Sh
     scheduler.start()
     logger.info(f"Scheduler started. Checking every 5 minutes for shifts starting in {config.notification_offset_minutes} minutes")
     
-    return scheduler
-
-
-async def post_init(application: Application):
-    logger.info("Bot initialized successfully")
+    application.bot_data['scheduler'] = scheduler
 
 
 async def post_shutdown(application: Application):
+    scheduler = application.bot_data.get('scheduler')
+    if scheduler:
+        scheduler.shutdown()
     logger.info("Bot shutdown completed")
 
 
@@ -79,9 +88,8 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("tasks", tasks_command))
     application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("setup_table", setup_table_command))
     application.add_handler(CallbackQueryHandler(button_callback))
-    
-    scheduler = setup_scheduler(application, config, sheets_manager)
     
     application.post_init = post_init
     application.post_shutdown = post_shutdown
@@ -96,7 +104,6 @@ def main():
     except KeyboardInterrupt:
         logger.info("Received interrupt signal")
     finally:
-        scheduler.shutdown()
         logger.info("Bot stopped")
 
 

@@ -3,7 +3,7 @@ version: '3.8'
 services:
   coffee-bot:
     build: .
-    container_name: wool-coffee-bot
+    container_name: coffee-cleaning-bot
     restart: unless-stopped
     env_file:
       - .env

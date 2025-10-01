@@ -148,17 +148,10 @@ class SheetsManager:
                 logger.warning(f"Not enough rows in sheet {sheet_name}")
                 return []
             
-            header_row = None
-            data_start_row = None
-            
-            for idx, row in enumerate(all_data):
-                if 'ФИО' in row and 'Должность' in row:
-                    header_row = row
-                    data_start_row = idx + 1
-                    break
+            header_row, data_start_row = self._find_period_section(all_data, today.day)
             
             if not header_row or data_start_row is None:
-                logger.warning(f"Could not find header row in {sheet_name}")
+                logger.warning(f"Could not find section for day {today.day}")
                 return []
             
             day_column_index = None
@@ -182,6 +175,9 @@ class SheetsManager:
                 
                 if not name or not shift_time or shift_time.lower() == 'в':
                     continue
+                
+                if name == 'ФИО' or shift_time in ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']:
+                    break
                 
                 employee_info = self.employees_cache.get(name)
                 
@@ -207,6 +203,23 @@ class SheetsManager:
         except Exception as e:
             logger.error(f"Error getting shifts: {e}")
             return []
+
+    def _find_period_section(self, all_data: List[List[str]], day: int) -> Tuple[Optional[List[str]], Optional[int]]:
+        for idx, row in enumerate(all_data):
+            if len(row) < 3:
+                continue
+            
+            if 'ФИО' in row and 'Должность' in row:
+                for cell in row[2:]:
+                    if cell.strip().isdigit():
+                        day_in_row = int(cell.strip())
+                        
+                        if day <= 15 and day_in_row <= 15:
+                            return row, idx + 1
+                        elif day > 15 and day_in_row > 15:
+                            return row, idx + 1
+        
+        return None, None
 
     def _parse_shift_time(self, shift_str: str) -> Tuple[Optional[str], Optional[str]]:
         try:

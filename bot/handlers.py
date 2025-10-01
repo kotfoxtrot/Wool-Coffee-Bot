@@ -3,6 +3,8 @@ from telegram.ext import ContextTypes
 from datetime import datetime
 import logging
 from .sheets_manager import SheetsManager
+from .table_setup import TableSetup
+from .config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -227,3 +229,38 @@ def _get_days_overdue(task: dict, today: datetime) -> int:
         return max(0, (today - next_cleaning).days)
     except ValueError:
         return 0
+
+
+async def setup_table_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    config: Config = context.bot_data['config']
+    
+    user_id = update.effective_user.id
+    
+    if config.admin_user_id is None:
+        await update.message.reply_text(
+            "❌ Команда недоступна: не указан ADMIN_USER_ID в настройках."
+        )
+        return
+    
+    if user_id != config.admin_user_id:
+        await update.message.reply_text(
+            "❌ У вас нет прав для выполнения этой команды."
+        )
+        return
+    
+    await update.message.reply_text("⏳ Начинаю проверку и настройку таблицы...")
+    
+    try:
+        sheets_manager: SheetsManager = context.bot_data['sheets_manager']
+        
+        table_setup = TableSetup(sheets_manager.spreadsheet)
+        report = table_setup.setup()
+        
+        sheets_manager.reload_employees()
+        sheets_manager._initialize_next_cleaning_dates()
+        
+        await update.message.reply_text(f"{report}\n\n🔄 Данные перезагружены.")
+        
+    except Exception as e:
+        logger.error(f"Error in setup_table_command: {e}")
+        await update.message.reply_text(f"❌ Ошибка при настройке таблицы: {str(e)}")
