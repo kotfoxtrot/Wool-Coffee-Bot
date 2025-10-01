@@ -10,6 +10,7 @@ services:
     volumes:
       - ./credentials.json:/app/credentials.json:ro
       - ./logs:/app/logs
+      - ./configs:/app/configs
     logging:
       driver: "json-file"
       options:

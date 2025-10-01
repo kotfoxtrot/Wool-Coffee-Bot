@@ -1,4 +1,5 @@
 from .config import Config
-from .sheets_manager import SheetsManager
+from .table_manager import TableManager
+from .cache_manager import CacheManager
 
-__all__ = ['Config', 'SheetsManager']
+__all__ = ['Config', 'TableManager', 'CacheManager']

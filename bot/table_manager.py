@@ -8,7 +8,7 @@ import re
 logger = logging.getLogger(__name__)
 
 
-class SheetsManager:
+class TableManager:
     MONTH_NAMES = {
         1: 'ЯНВАРЬ', 2: 'ФЕВРАЛЬ', 3: 'МАРТ', 4: 'АПРЕЛЬ',
         5: 'МАЙ', 6: 'ИЮНЬ', 7: 'ИЮЛЬ', 8: 'АВГУСТ',
@@ -62,6 +62,21 @@ class SheetsManager:
         except Exception as e:
             logger.error(f"Error loading employees: {e}")
             self.employees_cache = {}
+
+    def is_employee(self, username: str) -> bool:
+        if not username:
+            return False
+        username_lower = username.lower()
+        return any(emp['username'].lower() == username_lower for emp in self.employees_cache.values())
+
+    def get_employee_by_username(self, username: str) -> Optional[Dict]:
+        if not username:
+            return None
+        username_lower = username.lower()
+        for name, info in self.employees_cache.items():
+            if info['username'].lower() == username_lower:
+                return {'name': name, **info}
+        return None
 
     def _parse_period_days(self, period_str: str) -> Optional[int]:
         try:
@@ -128,10 +143,10 @@ class SheetsManager:
         except Exception as e:
             logger.error(f"Error initializing next cleaning dates: {e}")
 
-    def get_today_shifts(self, today: datetime) -> List[Dict]:
+    def get_shifts_for_date(self, date: datetime) -> List[Dict]:
         try:
-            month_name = self.MONTH_NAMES[today.month]
-            year_short = str(today.year)[2:]
+            month_name = self.MONTH_NAMES[date.month]
+            year_short = str(date.year)[2:]
             sheet_name = f"{month_name} {year_short}"
             
             logger.info(f"Looking for sheet: {sheet_name}")
@@ -148,20 +163,20 @@ class SheetsManager:
                 logger.warning(f"Not enough rows in sheet {sheet_name}")
                 return []
             
-            header_row, data_start_row = self._find_period_section(all_data, today.day)
+            header_row, data_start_row = self._find_period_section(all_data, date.day)
             
             if not header_row or data_start_row is None:
-                logger.warning(f"Could not find section for day {today.day}")
+                logger.warning(f"Could not find section for day {date.day}")
                 return []
             
             day_column_index = None
             for idx, cell in enumerate(header_row):
-                if cell.strip() == str(today.day):
+                if cell.strip() == str(date.day):
                     day_column_index = idx
                     break
             
             if day_column_index is None:
-                logger.warning(f"Could not find column for day {today.day}")
+                logger.warning(f"Could not find column for day {date.day}")
                 return []
             
             shifts = []
@@ -194,15 +209,67 @@ class SheetsManager:
                         'position': employee_info['position'],
                         'start_time': start_time,
                         'end_time': end_time,
-                        'shift_raw': shift_time
+                        'shift_raw': shift_time,
+                        'date': date
                     })
             
-            logger.info(f"Found {len(shifts)} shifts for {today.strftime('%d.%m.%Y')}")
+            logger.info(f"Found {len(shifts)} shifts for {date.strftime('%d.%m.%Y')}")
             return shifts
             
         except Exception as e:
             logger.error(f"Error getting shifts: {e}")
             return []
+
+    def get_today_shifts(self, today: datetime) -> List[Dict]:
+        return self.get_shifts_for_date(today)
+
+    def get_user_current_shift(self, username: str, now: datetime) -> Optional[Dict]:
+        shifts = self.get_shifts_for_date(now)
+        user_shift = next((s for s in shifts if s['username'].lower() == username.lower()), None)
+        
+        if not user_shift:
+            return None
+        
+        try:
+            start_time = datetime.strptime(user_shift['start_time'], "%H:%M").time()
+            end_time = datetime.strptime(user_shift['end_time'], "%H:%M").time()
+            
+            current_time = now.time()
+            
+            if end_time < start_time:
+                if current_time >= start_time or current_time < end_time:
+                    return user_shift
+            else:
+                if start_time <= current_time < end_time:
+                    return user_shift
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error checking current shift: {e}")
+            return None
+
+    def get_user_next_shift(self, username: str, now: datetime) -> Optional[Dict]:
+        max_days_ahead = 30
+        
+        for days_ahead in range(max_days_ahead + 1):
+            check_date = now + timedelta(days=days_ahead)
+            shifts = self.get_shifts_for_date(check_date)
+            
+            user_shift = next((s for s in shifts if s['username'].lower() == username.lower()), None)
+            
+            if user_shift:
+                if days_ahead == 0:
+                    try:
+                        start_time = datetime.strptime(user_shift['start_time'], "%H:%M").time()
+                        if now.time() < start_time:
+                            return user_shift
+                    except Exception:
+                        pass
+                else:
+                    return user_shift
+        
+        return None
 
     def _find_period_section(self, all_data: List[List[str]], day: int) -> Tuple[Optional[List[str]], Optional[int]]:
         for idx, row in enumerate(all_data):

@@ -2,12 +2,23 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from datetime import datetime, timedelta
 import logging
 import pytz
-from .sheets_manager import SheetsManager
+from .table_manager import TableManager
+from .members_manager import MembersManager
+from .cache_manager import CacheManager
 
 logger = logging.getLogger(__name__)
 
 
-async def check_and_send_notifications(bot: Bot, sheets_manager: SheetsManager, timezone_str: str, offset_minutes: int):
+async def refresh_cache_job(cache_manager: CacheManager):
+    try:
+        logger.info("Running scheduled cache refresh")
+        await cache_manager.refresh_from_sheets()
+        logger.info("Cache refresh completed")
+    except Exception as e:
+        logger.error(f"Error in refresh_cache_job: {e}")
+
+
+async def check_and_send_notifications(bot: Bot, cache_manager: CacheManager, members_manager: MembersManager, timezone_str: str, offset_minutes: int):
     try:
         tz = pytz.timezone(timezone_str)
         now = datetime.now(tz)
@@ -15,20 +26,23 @@ async def check_and_send_notifications(bot: Bot, sheets_manager: SheetsManager, 
         
         logger.info(f"Checking for shifts starting at {target_time.strftime('%H:%M')}")
         
-        shifts = sheets_manager.get_today_shifts(now)
+        cache_manager.invalidate_if_date_changed()
+        
+        shifts = cache_manager.cache.get('shifts_today', [])
         
         if not shifts:
             logger.info("No shifts found for today")
             return
         
-        tasks = sheets_manager.get_tasks_for_today(now)
+        tasks = cache_manager.cache.get('tasks', [])
+        tasks_today = [t for t in tasks if cache_manager._should_clean_today(t, now)]
         
-        if not tasks:
+        if not tasks_today:
             logger.info("No tasks found for today")
         
         for shift in shifts:
             if _should_notify(shift, now, target_time, offset_minutes):
-                await _send_employee_tasks(bot, shift, tasks, now)
+                await _send_employee_tasks(bot, shift, tasks_today, now, members_manager)
         
     except Exception as e:
         logger.error(f"Error in check_and_send_notifications: {e}")
@@ -63,23 +77,23 @@ def _should_notify(shift: dict, now: datetime, target_time: datetime, offset_min
         return False
 
 
-async def _send_employee_tasks(bot: Bot, shift: dict, tasks: list, today: datetime):
+async def _send_employee_tasks(bot: Bot, shift: dict, tasks: list, today: datetime, members_manager: MembersManager):
     try:
         username = shift['username']
         employee_name = shift['name']
         start_time = shift['start_time']
         
-        user = await _find_user_chat_id(bot, username)
+        user_id = members_manager.get_user_id(username)
         
-        if not user:
-            logger.warning(f"User @{username} ({employee_name}) not found or hasn't started the bot")
+        if not user_id:
+            logger.warning(f"User @{username} ({employee_name}) hasn't started the bot yet")
             return
         
-        message_text = _build_notification_message(tasks, employee_name, start_time, today)
+        message_text = _build_notification_message(tasks, start_time, today)
         keyboard = _build_tasks_keyboard(tasks)
         
         await bot.send_message(
-            chat_id=user,
+            chat_id=user_id,
             text=message_text,
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
@@ -91,20 +105,15 @@ async def _send_employee_tasks(bot: Bot, shift: dict, tasks: list, today: dateti
         logger.error(f"Error sending notification to {shift['name']}: {e}")
 
 
-async def _find_user_chat_id(bot: Bot, username: str):
-    return None
-
-
-def _build_notification_message(tasks: list, employee_name: str, start_time: str, today: datetime) -> str:
-    first_name = employee_name.split()[0] if employee_name else "Коллега"
+def _build_notification_message(tasks: list, start_time: str, today: datetime) -> str:
     total_tasks = len(tasks)
     
-    text = f"☕️ <b>Доброе утро, {first_name}!</b>\n"
+    text = f"☕️ <b>Привет!</b>\n\n"
     text += f"Твоя смена начинается в {start_time}\n"
     text += f"Задачи на {today.strftime('%d.%m.%Y')}:\n\n"
     
     if not tasks:
-        text += "✨ Сегодня нет задач по чистке!\n"
+        text += "Ура! Сегодня ничего не требуется 🎉\n"
     else:
         for task in tasks:
             is_overdue = _is_task_overdue(task, today)
@@ -113,8 +122,7 @@ def _build_notification_message(tasks: list, employee_name: str, start_time: str
                 days = (today - datetime.strptime(task['next_cleaning'], "%d.%m.%Y")).days
                 text += f"⚠️ <b>{task['name']}</b> <i>(просрочена на {days} дн.!)</i>\n"
             else:
-                next_date = task.get('next_cleaning', '-')
-                text += f"⏳ <b>{task['name']}</b> <i>(до {next_date})</i>\n"
+                text += f"⏳ <b>{task['name']}</b>\n"
     
         text += f"\n<b>Всего задач: {total_tasks}</b>"
     

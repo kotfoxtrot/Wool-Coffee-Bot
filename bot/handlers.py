@@ -2,42 +2,90 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from datetime import datetime
 import logging
-from .sheets_manager import SheetsManager
+import asyncio
+from .table_manager import TableManager
 from .table_setup import TableSetup
 from .config import Config
+from .members_manager import MembersManager
+from .cache_manager import CacheManager
 
 logger = logging.getLogger(__name__)
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = """
-☕️ Добро пожаловать в систему управления чисткой оборудования!
+async def check_employee(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    members_manager: MembersManager = context.bot_data['members_manager']
+    username = update.effective_user.username
+    
+    if not username:
+        await update.message.reply_text(
+            "❌ У тебя не установлен Telegram username. "
+            "Пожалуйста, установи username в настройках Telegram."
+        )
+        return False
+    
+    if not members_manager.is_member(username):
+        await update.message.reply_text(
+            "❌ Доступ запрещен. Этот бот доступен только для сотрудников."
+        )
+        return False
+    
+    return True
 
-Я помогу тебе отслеживать задачи по чистке оборудования в кофейне.
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    members_manager: MembersManager = context.bot_data['members_manager']
+    table_manager: TableManager = context.bot_data['table_manager']
+    
+    username = update.effective_user.username
+    user_id = update.effective_user.id
+    
+    if not username:
+        await update.message.reply_text(
+            "❌ У тебя не установлен Telegram username. "
+            "Пожалуйста, установи username в настройках Telegram."
+        )
+        return
+    
+    employee = table_manager.get_employee_by_username(username)
+    
+    if not employee:
+        await update.message.reply_text(
+            "❌ Доступ запрещен. Этот бот доступен только для сотрудников."
+        )
+        return
+    
+    members_manager.add_member(username, user_id, employee['name'])
+    
+    welcome_text = """
+☕️ Добро пожаловать в Wool Coffee Bot!
+
+Я помогу тебе отслеживать задачи по работе в кофейне.
 
 📋 Доступные команды:
-/tasks - Показать мои задачи на сегодня
+/tasks - Показать задачи на смену
 /history - История выполненных задач (7 дней)
 /help - Справка по командам
 
-Каждое утро я буду присылать список задач на день.
+В начале каждой смены я буду присылать список задач.
 Просто нажми кнопку "✅ Выполнено" когда закончишь задачу!
     """
     await update.message.reply_text(welcome_text)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_employee(update, context):
+        return
+    
     help_text = """
 📖 Справка по командам:
 
 /start - Приветствие и инструкция
-/tasks - Показать задачи на сегодня
+/tasks - Показать задачи на смену
 /history - История за последние 7 дней
 /help - Эта справка
 
 🔔 Как работает бот:
-• Каждое утро я проверяю твою смену
-• Отправляю список задач по чистке
+• В начале смены я присылаю список задач
 • Ты отмечаешь выполненные задачи кнопками
 • Данные автоматически сохраняются в таблицу
 
@@ -50,36 +98,43 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sheets_manager: SheetsManager = context.bot_data['sheets_manager']
+    if not await check_employee(update, context):
+        return
+    
+    cache_manager: CacheManager = context.bot_data['cache_manager']
+    table_manager: TableManager = context.bot_data['table_manager']
     username = update.effective_user.username
+    now = datetime.now()
     
-    if not username:
-        await update.message.reply_text(
-            "❌ У тебя не установлен Telegram username. "
-            "Пожалуйста, установи username в настройках Telegram."
-        )
-        return
+    current_shift = cache_manager.get_shift_for_user(username)
     
-    today = datetime.now()
-    shifts = sheets_manager.get_today_shifts(today)
+    if current_shift:
+        shift = current_shift
+        shift_date = now
+        is_current = True
+    else:
+        next_shift = table_manager.get_user_next_shift(username, now)
+        if not next_shift:
+            await update.message.reply_text(
+                "📅 У тебя нет предстоящих смен в ближайшие 30 дней."
+            )
+            return
+        shift = next_shift
+        shift_date = shift['date']
+        is_current = False
     
-    user_shift = next((s for s in shifts if s['username'].lower() == username.lower()), None)
-    
-    if not user_shift:
-        await update.message.reply_text(
-            f"📅 На {today.strftime('%d.%m.%Y')} у тебя нет смены или ты не добавлен в расписание."
-        )
-        return
-    
-    tasks = sheets_manager.get_tasks_for_today(today)
+    if is_current:
+        tasks = cache_manager.get_tasks_for_user(username, shift_date)
+    else:
+        tasks = table_manager.get_tasks_for_today(shift_date)
     
     if not tasks:
         await update.message.reply_text(
-            f"✨ На {today.strftime('%d.%m.%Y')} нет задач по чистке!"
+            "Ура! Сегодня ничего не требуется 🎉"
         )
         return
     
-    message_text, keyboard = _build_tasks_message(tasks, user_shift['name'], today)
+    message_text, keyboard = _build_tasks_message(tasks, shift, shift_date, is_current)
     
     await update.message.reply_text(
         message_text,
@@ -89,14 +144,13 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sheets_manager: SheetsManager = context.bot_data['sheets_manager']
-    username = update.effective_user.username
-    
-    if not username:
-        await update.message.reply_text("❌ У тебя не установлен Telegram username.")
+    if not await check_employee(update, context):
         return
     
-    history = sheets_manager.get_history(days=7)
+    table_manager: TableManager = context.bot_data['table_manager']
+    username = update.effective_user.username
+    
+    history = table_manager.get_history(days=7)
     
     if not history:
         await update.message.reply_text("📜 История за последние 7 дней пуста.")
@@ -122,7 +176,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    sheets_manager: SheetsManager = context.bot_data['sheets_manager']
+    cache_manager: CacheManager = context.bot_data['cache_manager']
+    members_manager: MembersManager = context.bot_data['members_manager']
+    username = update.effective_user.username
+    
+    if not members_manager.is_member(username):
+        await query.edit_message_text("❌ Доступ запрещен.")
+        return
     
     callback_data = query.data
     
@@ -130,71 +190,76 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     row_index = int(callback_data.split('_')[1])
-    username = update.effective_user.username
     
-    today = datetime.now()
-    shifts = sheets_manager.get_today_shifts(today)
-    user_shift = next((s for s in shifts if s['username'].lower() == username.lower()), None)
+    now = datetime.now()
+    shift = cache_manager.get_shift_for_user(username)
     
-    if not user_shift:
-        await query.edit_message_text("❌ Ты не найден в расписании на сегодня.")
+    if not shift:
+        await query.edit_message_text("❌ У тебя нет активной смены.")
         return
     
-    all_tasks = sheets_manager.get_equipment_tasks()
-    task = next((t for t in all_tasks if t['row_index'] == row_index), None)
+    tasks = cache_manager.get_tasks_for_user(username, now)
+    task = next((t for t in tasks if t['row_index'] == row_index), None)
     
     if not task:
         await query.edit_message_text("❌ Задача не найдена.")
         return
     
     completed_at = datetime.now()
-    success = sheets_manager.mark_task_completed(
-        row_index, 
-        user_shift['name'], 
-        completed_at,
-        task['period']
+    
+    cache_manager.mark_completed_local(row_index, username, completed_at)
+    
+    updated_tasks = cache_manager.get_tasks_for_user(username, now)
+    message_text, keyboard = _build_tasks_message(updated_tasks, shift, now, True)
+    
+    await query.edit_message_text(
+        message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
     )
     
-    if success:
-        tasks = sheets_manager.get_tasks_for_today(today)
-        message_text, keyboard = _build_tasks_message(tasks, user_shift['name'], today)
-        
-        await query.edit_message_text(
-            message_text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='HTML'
+    asyncio.create_task(
+        cache_manager.sync_to_sheets(
+            row_index,
+            shift['name'],
+            completed_at,
+            task['period']
         )
-    else:
-        await query.edit_message_text("❌ Ошибка при обновлении данных. Попробуй позже.")
+    )
 
 
-def _build_tasks_message(tasks: list, employee_name: str, today: datetime):
+def _build_tasks_message(tasks: list, shift: dict, shift_date: datetime, is_current: bool):
     completed_tasks = [t for t in tasks if t['status'] == '✅']
     total_tasks = len(tasks)
     completed_count = len(completed_tasks)
     
-    text = f"☕️ <b>Доброе утро, {employee_name.split()[0]}!</b>\n"
-    text += f"Задачи на {today.strftime('%d.%m.%Y')}:\n\n"
+    if is_current:
+        text = f"☕️ <b>Задачи на текущую смену</b>\n\n"
+        text += f"Смена: {shift['start_time']} - {shift['end_time']}\n"
+        text += f"Дата: {shift_date.strftime('%d.%m.%Y')}\n\n"
+    else:
+        text = f"☕️ <b>Задачи на следующую смену</b>\n\n"
+        text += f"Смена: {shift['start_time']} - {shift['end_time']}\n"
+        text += f"Дата: {shift_date.strftime('%d.%m.%Y')}\n\n"
     
     keyboard = []
     
     for task in tasks:
         is_completed = task['status'] == '✅'
-        is_overdue = _is_task_overdue(task, today)
+        is_overdue = _is_task_overdue(task, shift_date)
         
         if is_completed:
             completed_time = "сегодня"
             text += f"✅ <b>{task['name']}</b> (выполнено {completed_time})\n"
         else:
             if is_overdue:
-                days = _get_days_overdue(task, today)
+                days = _get_days_overdue(task, shift_date)
                 text += f"⚠️ <b>{task['name']}</b> <i>(просрочена на {days} дн.!)</i>\n"
             else:
-                next_date = task.get('next_cleaning', '-')
-                text += f"⏳ <b>{task['name']}</b> <i>(до {next_date})</i>\n"
+                text += f"⏳ <b>{task['name']}</b>\n"
             
             button = InlineKeyboardButton(
-                text="✅ Выполнено",
+                text=f"✅ {task['name']}",
                 callback_data=f"complete_{task['row_index']}"
             )
             keyboard.append([button])
@@ -244,23 +309,82 @@ async def setup_table_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     if user_id != config.admin_user_id:
         await update.message.reply_text(
-            "❌ У вас нет прав для выполнения этой команды."
+            "❌ У тебя нет прав для выполнения этой команды."
         )
         return
     
     await update.message.reply_text("⏳ Начинаю проверку и настройку таблицы...")
     
     try:
-        sheets_manager: SheetsManager = context.bot_data['sheets_manager']
+        table_manager: TableManager = context.bot_data['table_manager']
+        members_manager: MembersManager = context.bot_data['members_manager']
+        cache_manager: CacheManager = context.bot_data['cache_manager']
         
-        table_setup = TableSetup(sheets_manager.spreadsheet)
+        table_setup = TableSetup(table_manager.spreadsheet)
         report = table_setup.setup()
         
-        sheets_manager.reload_employees()
-        sheets_manager._initialize_next_cleaning_dates()
+        table_manager.reload_employees()
+        table_manager._initialize_next_cleaning_dates()
         
-        await update.message.reply_text(f"{report}\n\n🔄 Данные перезагружены.")
+        synced = members_manager.sync_with_table(table_manager.employees_cache)
+        
+        await cache_manager.refresh_from_sheets()
+        
+        await update.message.reply_text(
+            f"{report}\n\n🔄 Данные перезагружены.\n"
+            f"📝 Синхронизировано сотрудников: {len(table_manager.employees_cache)}"
+        )
         
     except Exception as e:
         logger.error(f"Error in setup_table_command: {e}")
         await update.message.reply_text(f"❌ Ошибка при настройке таблицы: {str(e)}")
+
+
+async def member_update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    config: Config = context.bot_data['config']
+    
+    user_id = update.effective_user.id
+    
+    if config.admin_user_id is None:
+        await update.message.reply_text(
+            "❌ Команда недоступна: не указан ADMIN_USER_ID в настройках."
+        )
+        return
+    
+    if user_id != config.admin_user_id:
+        await update.message.reply_text(
+            "❌ У тебя нет прав для выполнения этой команды."
+        )
+        return
+    
+    await update.message.reply_text("⏳ Обновляю данные сотрудников...")
+    
+    try:
+        table_manager: TableManager = context.bot_data['table_manager']
+        members_manager: MembersManager = context.bot_data['members_manager']
+        cache_manager: CacheManager = context.bot_data['cache_manager']
+        
+        old_count = len(table_manager.employees_cache)
+        
+        table_manager.reload_employees()
+        
+        new_count = len(table_manager.employees_cache)
+        
+        synced = members_manager.sync_with_table(table_manager.employees_cache)
+        
+        await cache_manager.refresh_from_sheets()
+        
+        registered_count = sum(1 for m in members_manager.get_all_members().values() if m['user_id'] is not None)
+        
+        await update.message.reply_text(
+            f"✅ Данные успешно обновлены!\n\n"
+            f"📊 Статистика:\n"
+            f"• Сотрудников в таблице: {new_count}\n"
+            f"• Изменение: {new_count - old_count:+d}\n"
+            f"• Зарегистрировано в боте: {registered_count}\n"
+            f"• Не зарегистрировано: {new_count - registered_count}"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in member_update_command: {e}")
+        await update.message.reply_text(f"❌ Ошибка при обновлении данных: {str(e)}")
