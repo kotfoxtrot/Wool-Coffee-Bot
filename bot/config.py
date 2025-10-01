@@ -8,7 +8,7 @@ class Config:
     telegram_token: str
     google_sheets_id: str
     google_credentials_file: str
-    notification_time: str
+    notification_offset_minutes: int
     timezone: str
     manager_chat_id: Optional[int] = None
 
@@ -18,7 +18,7 @@ class Config:
             telegram_token=os.getenv('TELEGRAM_BOT_TOKEN', ''),
             google_sheets_id=os.getenv('GOOGLE_SHEETS_ID', ''),
             google_credentials_file=os.getenv('GOOGLE_CREDENTIALS_FILE', 'credentials.json'),
-            notification_time=os.getenv('NOTIFICATION_TIME', '07:30'),
+            notification_offset_minutes=int(os.getenv('NOTIFICATION_OFFSET_MINUTES', '30')),
             timezone=os.getenv('TIMEZONE', 'Europe/Moscow'),
             manager_chat_id=int(os.getenv('MANAGER_CHAT_ID')) if os.getenv('MANAGER_CHAT_ID') else None
         )

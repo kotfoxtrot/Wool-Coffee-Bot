@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from .config import Config
 from .sheets_manager import SheetsManager
 from .handlers import start_command, help_command, tasks_command, history_command, button_callback
-from .scheduler import send_daily_notifications
+from .scheduler import check_and_send_notifications
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -25,19 +25,17 @@ logger = logging.getLogger(__name__)
 def setup_scheduler(application: Application, config: Config, sheets_manager: SheetsManager):
     scheduler = AsyncIOScheduler(timezone=config.timezone)
     
-    hour, minute = map(int, config.notification_time.split(':'))
-    
     scheduler.add_job(
-        send_daily_notifications,
-        trigger=CronTrigger(hour=hour, minute=minute, timezone=config.timezone),
-        args=[application.bot, sheets_manager, config.timezone],
-        id='daily_notifications',
-        name='Send daily task notifications',
+        check_and_send_notifications,
+        trigger=CronTrigger(minute='*/5', timezone=config.timezone),
+        args=[application.bot, sheets_manager, config.timezone, config.notification_offset_minutes],
+        id='check_notifications',
+        name='Check and send notifications',
         replace_existing=True
     )
     
     scheduler.start()
-    logger.info(f"Scheduler started. Notifications will be sent at {config.notification_time} {config.timezone}")
+    logger.info(f"Scheduler started. Checking every 5 minutes for shifts starting in {config.notification_offset_minutes} minutes")
     
     return scheduler
 

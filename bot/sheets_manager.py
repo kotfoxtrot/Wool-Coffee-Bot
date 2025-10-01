@@ -1,18 +1,25 @@
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 class SheetsManager:
+    MONTH_NAMES = {
+        1: 'ЯНВАРЬ', 2: 'ФЕВРАЛЬ', 3: 'МАРТ', 4: 'АПРЕЛЬ',
+        5: 'МАЙ', 6: 'ИЮНЬ', 7: 'ИЮЛЬ', 8: 'АВГУСТ',
+        9: 'СЕНТЯБРЬ', 10: 'ОКТЯБРЬ', 11: 'НОЯБРЬ', 12: 'ДЕКАБРЬ'
+    }
+    
     def __init__(self, credentials_file: str, spreadsheet_id: str):
         self.credentials_file = credentials_file
         self.spreadsheet_id = spreadsheet_id
         self.client = None
         self.spreadsheet = None
+        self.employees_cache = {}
         
     def connect(self):
         try:
@@ -27,32 +34,148 @@ class SheetsManager:
             self.client = gspread.authorize(creds)
             self.spreadsheet = self.client.open_by_key(self.spreadsheet_id)
             logger.info("Successfully connected to Google Sheets")
+            self._load_employees()
         except Exception as e:
             logger.error(f"Failed to connect to Google Sheets: {e}")
             raise
 
-    def get_today_shifts(self, today: datetime) -> List[Dict]:
+    def _load_employees(self):
         try:
-            sheet = self.spreadsheet.worksheet("Смены")
+            sheet = self.spreadsheet.worksheet("Сотрудники")
             data = sheet.get_all_records()
             
-            today_str = today.strftime("%d.%m.%Y")
+            for row in data:
+                name = row.get('ФИО', '').strip()
+                username = row.get('Telegram Username', '').strip().replace('@', '')
+                position = row.get('Должность', '').strip()
+                
+                if name and username:
+                    self.employees_cache[name] = {
+                        'username': username,
+                        'position': position
+                    }
+            
+            logger.info(f"Loaded {len(self.employees_cache)} employees")
+            
+        except Exception as e:
+            logger.error(f"Error loading employees: {e}")
+            self.employees_cache = {}
+
+    def get_today_shifts(self, today: datetime) -> List[Dict]:
+        try:
+            month_name = self.MONTH_NAMES[today.month]
+            year_short = str(today.year)[2:]
+            sheet_name = f"{month_name} {year_short}"
+            
+            logger.info(f"Looking for sheet: {sheet_name}")
+            
+            try:
+                sheet = self.spreadsheet.worksheet(sheet_name)
+            except gspread.exceptions.WorksheetNotFound:
+                logger.warning(f"Sheet '{sheet_name}' not found")
+                return []
+            
+            all_data = sheet.get_all_values()
+            
+            if len(all_data) < 6:
+                logger.warning(f"Not enough rows in sheet {sheet_name}")
+                return []
+            
+            header_row = None
+            data_start_row = None
+            
+            for idx, row in enumerate(all_data):
+                if 'ФИО' in row and 'Должность' in row:
+                    header_row = row
+                    data_start_row = idx + 1
+                    break
+            
+            if not header_row or data_start_row is None:
+                logger.warning(f"Could not find header row in {sheet_name}")
+                return []
+            
+            day_column_index = None
+            for idx, cell in enumerate(header_row):
+                if cell.strip() == str(today.day):
+                    day_column_index = idx
+                    break
+            
+            if day_column_index is None:
+                logger.warning(f"Could not find column for day {today.day}")
+                return []
+            
             shifts = []
             
-            for row in data:
-                if row.get('Дата') == today_str:
+            for row in all_data[data_start_row:]:
+                if len(row) <= day_column_index:
+                    continue
+                
+                name = row[0].strip() if len(row) > 0 else ''
+                shift_time = row[day_column_index].strip() if len(row) > day_column_index else ''
+                
+                if not name or not shift_time or shift_time.lower() == 'в':
+                    continue
+                
+                employee_info = self.employees_cache.get(name)
+                
+                if not employee_info:
+                    logger.warning(f"Employee {name} not found in cache")
+                    continue
+                
+                start_time, end_time = self._parse_shift_time(shift_time)
+                
+                if start_time:
                     shifts.append({
-                        'name': row.get('ФИО', ''),
-                        'username': row.get('Telegram Username', '').replace('@', ''),
-                        'start_time': row.get('Время начала', '')
+                        'name': name,
+                        'username': employee_info['username'],
+                        'position': employee_info['position'],
+                        'start_time': start_time,
+                        'end_time': end_time,
+                        'shift_raw': shift_time
                     })
             
-            logger.info(f"Found {len(shifts)} shifts for {today_str}")
+            logger.info(f"Found {len(shifts)} shifts for {today.strftime('%d.%m.%Y')}")
             return shifts
             
         except Exception as e:
             logger.error(f"Error getting shifts: {e}")
             return []
+
+    def _parse_shift_time(self, shift_str: str) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            if '-' not in shift_str:
+                return None, None
+            
+            parts = shift_str.split('-')
+            if len(parts) != 2:
+                return None, None
+            
+            start = parts[0].strip()
+            end = parts[1].strip()
+            
+            if len(start) == 2:
+                start = f"{start}:00"
+            elif len(start) == 4:
+                start = f"{start[:2]}:{start[2:]}"
+            elif len(start) == 5 and ':' in start:
+                pass
+            else:
+                start = f"{start}:00"
+            
+            if len(end) == 2:
+                end = f"{end}:00"
+            elif len(end) == 4:
+                end = f"{end[:2]}:{end[2:]}"
+            elif len(end) == 5 and ':' in end:
+                pass
+            else:
+                end = f"{end}:00"
+            
+            return start, end
+            
+        except Exception as e:
+            logger.error(f"Error parsing shift time '{shift_str}': {e}")
+            return None, None
 
     def get_equipment_tasks(self) -> List[Dict]:
         try:
@@ -115,13 +238,12 @@ class SheetsManager:
             sheet = self.spreadsheet.worksheet("Оборудование")
             
             date_str = completed_at.strftime("%d.%m.%Y")
-            time_str = completed_at.strftime("%H:%M")
             
             sheet.update_cell(row_index, 3, date_str)
             sheet.update_cell(row_index, 4, completed_by)
             sheet.update_cell(row_index, 5, "✅")
             
-            logger.info(f"Task at row {row_index} marked as completed by {completed_by} at {time_str}")
+            logger.info(f"Task at row {row_index} marked as completed by {completed_by}")
             return True
             
         except Exception as e:
@@ -157,3 +279,10 @@ class SheetsManager:
         except Exception as e:
             logger.error(f"Error getting history: {e}")
             return []
+
+    def get_employee_username(self, name: str) -> Optional[str]:
+        employee = self.employees_cache.get(name)
+        return employee['username'] if employee else None
+
+    def reload_employees(self):
+        self._load_employees()
