@@ -3,6 +3,7 @@ from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class SheetsManager:
             self.spreadsheet = self.client.open_by_key(self.spreadsheet_id)
             logger.info("Successfully connected to Google Sheets")
             self._load_employees()
+            self._initialize_next_cleaning_dates()
         except Exception as e:
             logger.error(f"Failed to connect to Google Sheets: {e}")
             raise
@@ -46,10 +48,10 @@ class SheetsManager:
             
             for row in data:
                 name = row.get('ФИО', '').strip()
-                username = row.get('Telegram Username', '').strip().replace('@', '')
+                username = row.get('Telegram', '').strip().replace('@', '')
                 position = row.get('Должность', '').strip()
                 
-                if name and username:
+                if name and username and username.lower() != 'none':
                     self.employees_cache[name] = {
                         'username': username,
                         'position': position
@@ -60,6 +62,71 @@ class SheetsManager:
         except Exception as e:
             logger.error(f"Error loading employees: {e}")
             self.employees_cache = {}
+
+    def _parse_period_days(self, period_str: str) -> Optional[int]:
+        try:
+            match = re.search(r'(\d+)', period_str)
+            if match:
+                return int(match.group(1))
+            return None
+        except Exception as e:
+            logger.error(f"Error parsing period '{period_str}': {e}")
+            return None
+
+    def _initialize_next_cleaning_dates(self):
+        try:
+            sheet = self.spreadsheet.worksheet("График чистки")
+            all_data = sheet.get_all_values()
+            
+            if len(all_data) < 2:
+                return
+            
+            updates = []
+            today = datetime.now()
+            
+            for idx in range(1, len(all_data)):
+                row = all_data[idx]
+                
+                if len(row) < 4:
+                    continue
+                
+                name = row[0].strip() if len(row) > 0 else ''
+                period_str = row[1].strip() if len(row) > 1 else ''
+                last_cleaned_str = row[2].strip() if len(row) > 2 else ''
+                next_cleaning_str = row[3].strip() if len(row) > 3 else ''
+                
+                if not name or not period_str:
+                    continue
+                
+                if next_cleaning_str and next_cleaning_str != '-':
+                    continue
+                
+                period_days = self._parse_period_days(period_str)
+                if not period_days:
+                    continue
+                
+                if last_cleaned_str and last_cleaned_str != '-':
+                    try:
+                        last_cleaned = datetime.strptime(last_cleaned_str, "%d.%m.%Y")
+                        next_cleaning = last_cleaned + timedelta(days=period_days)
+                    except ValueError:
+                        next_cleaning = today + timedelta(days=period_days)
+                else:
+                    next_cleaning = today + timedelta(days=period_days)
+                
+                next_cleaning_str = next_cleaning.strftime("%d.%m.%Y")
+                updates.append({
+                    'range': f'D{idx + 1}',
+                    'values': [[next_cleaning_str]]
+                })
+            
+            if updates:
+                for update in updates:
+                    sheet.update(update['range'], update['values'])
+                logger.info(f"Initialized {len(updates)} next cleaning dates")
+            
+        except Exception as e:
+            logger.error(f"Error initializing next cleaning dates: {e}")
 
     def get_today_shifts(self, today: datetime) -> List[Dict]:
         try:
@@ -77,7 +144,7 @@ class SheetsManager:
             
             all_data = sheet.get_all_values()
             
-            if len(all_data) < 6:
+            if len(all_data) < 4:
                 logger.warning(f"Not enough rows in sheet {sheet_name}")
                 return []
             
@@ -179,7 +246,7 @@ class SheetsManager:
 
     def get_equipment_tasks(self) -> List[Dict]:
         try:
-            sheet = self.spreadsheet.worksheet("Оборудование")
+            sheet = self.spreadsheet.worksheet("График чистки")
             data = sheet.get_all_records()
             
             tasks = []
@@ -187,8 +254,9 @@ class SheetsManager:
                 tasks.append({
                     'row_index': idx,
                     'name': row.get('Название', ''),
-                    'frequency': row.get('Периодичность', ''),
+                    'period': row.get('Периодичность', ''),
                     'last_cleaned': row.get('Последняя чистка', ''),
+                    'next_cleaning': row.get('Следующая чистка', ''),
                     'completed_by': row.get('Выполнил', ''),
                     'status': row.get('Статус', '')
                 })
@@ -208,42 +276,55 @@ class SheetsManager:
             if self._should_clean_today(task, today):
                 tasks_today.append(task)
         
+        logger.info(f"Found {len(tasks_today)} tasks for today")
         return tasks_today
 
     def _should_clean_today(self, task: Dict, today: datetime) -> bool:
-        frequency = task['frequency'].lower()
-        last_cleaned_str = task['last_cleaned']
+        next_cleaning_str = task['next_cleaning']
         
-        if not last_cleaned_str or last_cleaned_str == '-':
-            return True
+        if not next_cleaning_str or next_cleaning_str == '-':
+            last_cleaned_str = task['last_cleaned']
+            period_str = task['period']
+            
+            if not last_cleaned_str or last_cleaned_str == '-':
+                return True
+            
+            period_days = self._parse_period_days(period_str)
+            if not period_days:
+                return False
+            
+            try:
+                last_cleaned = datetime.strptime(last_cleaned_str, "%d.%m.%Y")
+                days_passed = (today - last_cleaned).days
+                return days_passed >= period_days
+            except ValueError:
+                return True
         
         try:
-            last_cleaned = datetime.strptime(last_cleaned_str, "%d.%m.%Y")
+            next_cleaning = datetime.strptime(next_cleaning_str, "%d.%m.%Y")
+            return next_cleaning.date() <= today.date()
         except ValueError:
-            return True
-        
-        days_passed = (today - last_cleaned).days
-        
-        if frequency == 'ежедневно':
-            return days_passed >= 1
-        elif frequency == 'еженедельно':
-            return days_passed >= 7
-        elif frequency == 'ежемесячно':
-            return days_passed >= 30
-        
-        return False
+            return False
 
-    def mark_task_completed(self, row_index: int, completed_by: str, completed_at: datetime):
+    def mark_task_completed(self, row_index: int, completed_by: str, completed_at: datetime, period_str: str):
         try:
-            sheet = self.spreadsheet.worksheet("Оборудование")
+            sheet = self.spreadsheet.worksheet("График чистки")
             
-            date_str = completed_at.strftime("%d.%m.%Y")
+            last_cleaned_str = completed_at.strftime("%d.%m.%Y")
             
-            sheet.update_cell(row_index, 3, date_str)
-            sheet.update_cell(row_index, 4, completed_by)
-            sheet.update_cell(row_index, 5, "✅")
+            period_days = self._parse_period_days(period_str)
+            if period_days:
+                next_cleaning = completed_at + timedelta(days=period_days)
+                next_cleaning_str = next_cleaning.strftime("%d.%m.%Y")
+            else:
+                next_cleaning_str = "-"
             
-            logger.info(f"Task at row {row_index} marked as completed by {completed_by}")
+            sheet.update_cell(row_index, 3, last_cleaned_str)
+            sheet.update_cell(row_index, 4, next_cleaning_str)
+            sheet.update_cell(row_index, 5, completed_by)
+            sheet.update_cell(row_index, 6, "✅")
+            
+            logger.info(f"Task at row {row_index} marked as completed by {completed_by}, next cleaning: {next_cleaning_str}")
             return True
             
         except Exception as e:
@@ -252,7 +333,7 @@ class SheetsManager:
 
     def get_history(self, days: int = 7) -> List[Dict]:
         try:
-            sheet = self.spreadsheet.worksheet("Оборудование")
+            sheet = self.spreadsheet.worksheet("График чистки")
             data = sheet.get_all_records()
             
             cutoff_date = datetime.now() - timedelta(days=days)
@@ -268,7 +349,8 @@ class SheetsManager:
                                 'name': row.get('Название', ''),
                                 'date': last_cleaned,
                                 'completed_by': row.get('Выполнил', ''),
-                                'status': row.get('Статус', '')
+                                'status': row.get('Статус', ''),
+                                'next_cleaning': row.get('Следующая чистка', '')
                             })
                     except ValueError:
                         continue

@@ -110,9 +110,11 @@ def _build_notification_message(tasks: list, employee_name: str, start_time: str
             is_overdue = _is_task_overdue(task, today)
             
             if is_overdue:
-                text += f"⏳ <b>{task['name']}</b> <i>(просрочена с {task['last_cleaned']}!)</i>\n"
+                days = (today - datetime.strptime(task['next_cleaning'], "%d.%m.%Y")).days
+                text += f"⚠️ <b>{task['name']}</b> <i>(просрочена на {days} дн.!)</i>\n"
             else:
-                text += f"⏳ <b>{task['name']}</b>\n"
+                next_date = task.get('next_cleaning', '-')
+                text += f"⏳ <b>{task['name']}</b> <i>(до {next_date})</i>\n"
     
         text += f"\n<b>Всего задач: {total_tasks}</b>"
     
@@ -135,23 +137,13 @@ def _build_tasks_keyboard(tasks: list) -> list:
 
 
 def _is_task_overdue(task: dict, today: datetime) -> bool:
-    last_cleaned_str = task['last_cleaned']
-    frequency = task['frequency'].lower()
+    next_cleaning_str = task.get('next_cleaning', '')
     
-    if not last_cleaned_str or last_cleaned_str == '-':
+    if not next_cleaning_str or next_cleaning_str == '-':
         return False
     
     try:
-        last_cleaned = datetime.strptime(last_cleaned_str, "%d.%m.%Y")
-        days_passed = (today - last_cleaned).days
-        
-        if frequency == 'ежедневно' and days_passed > 1:
-            return True
-        elif frequency == 'еженедельно' and days_passed > 7:
-            return True
-        elif frequency == 'ежемесячно' and days_passed > 30:
-            return True
+        next_cleaning = datetime.strptime(next_cleaning_str, "%d.%m.%Y")
+        return (today - next_cleaning).days > 0
     except ValueError:
         return False
-    
-    return False

@@ -138,11 +138,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Ты не найден в расписании на сегодня.")
         return
     
+    all_tasks = sheets_manager.get_equipment_tasks()
+    task = next((t for t in all_tasks if t['row_index'] == row_index), None)
+    
+    if not task:
+        await query.edit_message_text("❌ Задача не найдена.")
+        return
+    
     completed_at = datetime.now()
     success = sheets_manager.mark_task_completed(
         row_index, 
         user_shift['name'], 
-        completed_at
+        completed_at,
+        task['period']
     )
     
     if success:
@@ -177,10 +185,11 @@ def _build_tasks_message(tasks: list, employee_name: str, today: datetime):
             text += f"✅ <b>{task['name']}</b> (выполнено {completed_time})\n"
         else:
             if is_overdue:
-                days_overdue = _get_days_overdue(task, today)
-                text += f"⏳ <b>{task['name']}</b> <i>(просрочена с {task['last_cleaned']}!)</i>\n"
+                days = _get_days_overdue(task, today)
+                text += f"⚠️ <b>{task['name']}</b> <i>(просрочена на {days} дн.!)</i>\n"
             else:
-                text += f"⏳ <b>{task['name']}</b>\n"
+                next_date = task.get('next_cleaning', '-')
+                text += f"⏳ <b>{task['name']}</b> <i>(до {next_date})</i>\n"
             
             button = InlineKeyboardButton(
                 text="✅ Выполнено",
@@ -194,36 +203,27 @@ def _build_tasks_message(tasks: list, employee_name: str, today: datetime):
 
 
 def _is_task_overdue(task: dict, today: datetime) -> bool:
-    last_cleaned_str = task['last_cleaned']
-    frequency = task['frequency'].lower()
+    next_cleaning_str = task.get('next_cleaning', '')
     
-    if not last_cleaned_str or last_cleaned_str == '-':
+    if not next_cleaning_str or next_cleaning_str == '-':
         return False
     
     try:
-        last_cleaned = datetime.strptime(last_cleaned_str, "%d.%m.%Y")
-        days_passed = (today - last_cleaned).days
-        
-        if frequency == 'ежедневно' and days_passed > 1:
-            return True
-        elif frequency == 'еженедельно' and days_passed > 7:
-            return True
-        elif frequency == 'ежемесячно' and days_passed > 30:
-            return True
+        next_cleaning = datetime.strptime(next_cleaning_str, "%d.%m.%Y")
+        days_overdue = (today - next_cleaning).days
+        return days_overdue > 0
     except ValueError:
         return False
-    
-    return False
 
 
 def _get_days_overdue(task: dict, today: datetime) -> int:
-    last_cleaned_str = task['last_cleaned']
+    next_cleaning_str = task.get('next_cleaning', '')
     
-    if not last_cleaned_str or last_cleaned_str == '-':
+    if not next_cleaning_str or next_cleaning_str == '-':
         return 0
     
     try:
-        last_cleaned = datetime.strptime(last_cleaned_str, "%d.%m.%Y")
-        return (today - last_cleaned).days
+        next_cleaning = datetime.strptime(next_cleaning_str, "%d.%m.%Y")
+        return max(0, (today - next_cleaning).days)
     except ValueError:
         return 0
