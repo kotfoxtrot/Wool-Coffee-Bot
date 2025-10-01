@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  coffee-bot:
+    build: .
+    container_name: wool-coffee-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./credentials.json:/app/credentials.json:ro
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      - TZ=Europe/Moscow
